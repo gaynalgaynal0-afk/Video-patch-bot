@@ -27,12 +27,37 @@ def get_payload():
     return int(d["payload"]) if d.get("success") else None
 
 def patch_mp4(raw, payload):
-    idx = raw.find(b"elst")
-    if idx == -1:
-        return None
     data = bytearray(raw)
-    struct.pack_into(">I", data, idx + 8, payload)
-    return bytes(data)
+
+    # Try elst first (same as extension)
+    idx = raw.find(b"elst")
+    if idx != -1:
+        struct.pack_into(">I", data, idx + 8, payload)
+        return bytes(data), "elst"
+
+    # Fallback: patch mvhd timescale — works on ALL mp4 files
+    idx = raw.find(b"mvhd")
+    if idx != -1:
+        version = raw[idx + 4]
+        if version == 0:
+            # version 0: timescale at offset +12, duration at +16
+            old_ts  = struct.unpack_from(">I", raw, idx + 12)[0]
+            old_dur = struct.unpack_from(">I", raw, idx + 16)[0]
+            new_ts  = 60000
+            new_dur = int(old_dur * new_ts / old_ts) if old_ts > 0 else old_dur
+            struct.pack_into(">I", data, idx + 12, new_ts)
+            struct.pack_into(">I", data, idx + 16, new_dur)
+        else:
+            # version 1: timescale at offset +20, duration at +24 (8 bytes)
+            old_ts  = struct.unpack_from(">I", raw, idx + 20)[0]
+            old_dur = struct.unpack_from(">Q", raw, idx + 24)[0]
+            new_ts  = 60000
+            new_dur = int(old_dur * new_ts / old_ts) if old_ts > 0 else old_dur
+            struct.pack_into(">I", data, idx + 20, new_ts)
+            struct.pack_into(">Q", data, idx + 24, new_dur)
+        return bytes(data), "mvhd"
+
+    return None, None
 
 # ---------- /start ----------
 @bot.message_handler(commands=["start"])
@@ -95,7 +120,6 @@ def handle_video(msg):
     status = bot.send_message(cid, "⏳ Downloading video...")
 
     try:
-        # Telegram bot API hard limit is 20MB
         if file_size > 20 * 1024 * 1024:
             bot.edit_message_text(
                 "⚠️ File is over 20MB — Telegram limit.\n"
@@ -119,10 +143,10 @@ def handle_video(msg):
 
         bot.edit_message_text("💉 Injecting binary payload...", cid, status.message_id)
 
-        patched = patch_mp4(raw, payload)
+        patched, method = patch_mp4(raw, payload)
         if patched is None:
             bot.edit_message_text(
-                "❌ elst atom not found.\nMake sure it is a valid MP4 file.",
+                "❌ Could not patch this file.\nMake sure it is a valid MP4 file.",
                 cid, status.message_id
             )
             return
@@ -138,7 +162,7 @@ def handle_video(msg):
         with open(tmp_path, "rb") as f:
             bot.send_document(
                 cid, f,
-                caption="✅ Patch complete!\n\nUpload to TikTok now 🚀",
+                caption="✅ Patch complete! [" + method + "]\n\nUpload to TikTok now 🚀",
                 visible_file_name=out_name
             )
 
